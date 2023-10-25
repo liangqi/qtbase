@@ -1,4 +1,4 @@
-QT += widgets
+QT += widgets gui-private
 requires(qtConfig(tablewidget))
 
 HEADERS = droparea.h \

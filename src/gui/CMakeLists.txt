@@ -950,6 +950,10 @@ qt_internal_extend_target(Gui CONDITION QT_FEATURE_glib AND UNIX
 qt_internal_extend_target(Gui CONDITION UNIX AND (QT_FEATURE_xcb OR NOT UIKIT)
     SOURCES
         platform/unix/qgenericunixservices.cpp platform/unix/qgenericunixservices_p.h
+    DBUS_INTERFACE_SOURCES
+        platform/unix/org.freedesktop.portal.FileTransfer.xml
+    DBUS_INTERFACE_FLAGS
+        -i platform/unix/dbustypes_p.h
 )
 
 qt_internal_extend_target(Gui CONDITION UNIX AND (QT_FEATURE_xcb)

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LicenseRef-Qt-Commercial OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "qgenericunixservices_p.h"
+#include "filetransfer_interface.h"
 #include <QtGui/private/qtguiglobal_p.h>
 #include "qguiapplication.h"
 #include "qwindow.h"
@@ -19,6 +20,7 @@
 #endif
 #include <QtCore/QStandardPaths>
 #include <QtCore/QUrl>
+#include <QtCore/QMimeData>
 
 #if QT_CONFIG(dbus)
 // These QtCore includes are needed for xdg-desktop-portal support
@@ -373,6 +375,8 @@ QGenericUnixServices::QGenericUnixServices()
     if (qEnvironmentVariableIntValue("QT_NO_XDG_DESKTOP_PORTAL") > 0) {
         return;
     }
+
+    {
     QDBusMessage message = QDBusMessage::createMethodCall(
             "org.freedesktop.portal.Desktop"_L1, "/org/freedesktop/portal/desktop"_L1,
             "org.freedesktop.DBus.Properties"_L1, "Get"_L1);
@@ -388,7 +392,27 @@ QGenericUnixServices::QGenericUnixServices()
                          if (!reply.isError() && reply.value().toUInt() >= 2)
                              m_hasScreenshotPortalWithColorPicking = true;
                      });
+    }
 
+    {
+    QDBusMessage message = QDBusMessage::createMethodCall(
+            "org.freedesktop.portal.Documents"_L1, "/org/freedesktop/portal/documents"_L1,
+            "org.freedesktop.DBus.Properties"_L1, "Get"_L1);
+    message << "org.freedesktop.portal.FileTransfer"_L1
+            << "version"_L1;
+
+    QDBusPendingCall pendingCall = QDBusConnection::sessionBus().asyncCall(message);
+    auto watcher = new QDBusPendingCallWatcher(pendingCall);
+    QObject::connect(watcher, &QDBusPendingCallWatcher::finished, watcher,
+                     [this](QDBusPendingCallWatcher *watcher) {
+                         watcher->deleteLater();
+                         QDBusPendingReply<QVariant> reply = *watcher;
+                         if (!reply.isError() && reply.value().toUInt() >= 1) {
+                             qDebug() << "m_hasFileTransfer = true";
+                             m_hasFileTransfer = true;
+                         }
+                     });
+    }
 #endif
 }
 
@@ -597,6 +621,159 @@ void QGenericUnixServices::setApplicationBadge(qint64 number)
     QDBusConnection::sessionBus().send(signal);
 #else
     Q_UNUSED(number)
+#endif
+}
+
+static QStringList urlListToStringList(const QList<QUrl> urls)
+{
+    QStringList list;
+    for (const auto &url : urls) {
+        list << url.toLocalFile();
+    }
+    return list;
+}
+
+static std::optional<QStringList> fuseRedirect(QList<QUrl> urls)
+{
+    return urlListToStringList(urls);
+}
+
+static QString portalServiceName()
+{
+    return QStringLiteral("org.freedesktop.portal.Documents");
+}
+
+static QString portalFormat()
+{
+    return QStringLiteral("application/vnd.portal.filetransfer");
+}
+
+static QList<QUrl> extractPortalUriList(const QMimeData *mimeData)
+{
+    Q_ASSERT(QCoreApplication::instance()->thread() == QThread::currentThread());
+    static std::pair<QByteArray, QList<QUrl>> cache;
+    const auto transferId = mimeData->data(portalFormat());
+    qDebug() << "Picking up portal urls from transfer" << transferId;
+    if (std::get<QByteArray>(cache) == transferId) {
+        const auto uris = std::get<QList<QUrl>>(cache);
+        qDebug() << "Urls from portal cache" << uris;
+        return uris;
+    }
+    auto iface =
+        new OrgFreedesktopPortalFileTransferInterface(portalServiceName(), QStringLiteral("/org/freedesktop/portal/documents"), QDBusConnection::sessionBus());
+    const QStringList list = iface->RetrieveFiles(QString::fromUtf8(transferId), {});
+    QList<QUrl> uris;
+    uris.reserve(list.size());
+    for (const auto &path : list) {
+        uris.append(QUrl::fromLocalFile(path));
+    }
+    qDebug() << "Urls from portal" << uris;
+    cache = std::make_pair(transferId, uris);
+    return uris;
+}
+
+QList<QUrl> QGenericUnixServices::urlsFromMimeData(const QMimeData *mimeData)
+{
+    QList<QUrl> uris;
+
+#if QT_CONFIG(dbus)
+    if (m_hasFileTransfer && mimeData->hasFormat(portalFormat())) {
+        uris = extractPortalUriList(mimeData);
+    }
+#endif
+
+    return uris;
+}
+
+bool QGenericUnixServices::exportUrlsToPortal(QMimeData *mimeData)
+{
+#if QT_CONFIG(dbus)
+    if (!m_hasFileTransfer) {
+        return false;
+    }
+    QList<QUrl> urls = mimeData->urls();
+
+    for (const auto &url : urls) {
+        const auto isLocal = url.isLocalFile();
+        if (!isLocal) {
+            return false;
+        } else {
+            const QFileInfo info(url.toLocalFile());
+            if (info.isDir()) {
+                // XDG Document Portal doesn't support directories and silently drops them.
+                return false;
+            }
+            if (info.isSymbolicLink()) {
+                // XDG Document Portal also doesn't support symlinks since it doesn't let us open the fd O_NOFOLLOW.
+                // https://github.com/flatpak/xdg-desktop-portal/issues/961#issuecomment-1573646299
+                return false;
+            }
+        }
+    }
+
+    auto iface =
+        new OrgFreedesktopPortalFileTransferInterface(portalServiceName(), QStringLiteral("/org/freedesktop/portal/documents"), QDBusConnection::sessionBus());
+
+    // Do not autostop, we'll stop once our mimedata disappears (i.e. the drag operation has finished);
+    // Otherwise not-wellbehaved clients that read the urls multiple times will trip the automatic-transfer-
+    // closing-upon-read inside the portal and have any reads, but the first, not properly resolve anymore.
+    const QString transferId = iface->StartTransfer({{QStringLiteral("autostop"), QVariant::fromValue(false)}});
+    mimeData->setData(QStringLiteral("application/vnd.portal.filetransfer"), QFile::encodeName(transferId));
+
+    auto optionalPaths = fuseRedirect(urls);
+    if (!optionalPaths.has_value()) {
+        qWarning() << "optionalPaths is Empty!";
+        return false;
+    }
+    // Prevent running into "too many open files" errors.
+    // Because submission of calls happens on the qdbus thread we may be feeding
+    // it QDBusUnixFileDescriptors faster than it can submit them over the wire, this would eventually
+    // lead to running into the open file cap since the QDBusUnixFileDescriptor hold
+    // an open FD until their call has been made.
+    // To prevent this from happening we collect a submission batch, make the call and **wait** for
+    // the call to succeed.
+    FDList pendingFds;
+    static constexpr decltype(pendingFds.size()) maximumBatchSize = 16;
+    pendingFds.reserve(maximumBatchSize);
+
+    const auto addFilesAndClear = [transferId, &iface, &pendingFds]() {
+        if (pendingFds.isEmpty()) {
+            return;
+        }
+        auto reply = iface->AddFiles(transferId, pendingFds, {});
+        reply.waitForFinished();
+        if (reply.isError()) {
+            qWarning() << "Some files could not be exported. " << reply.error();
+        }
+        pendingFds.clear();
+    };
+
+    for (const auto &path : optionalPaths.value()) {
+        const int fd = open(QFile::encodeName(path).constData(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (fd == -1) {
+            const int error = errno;
+            qWarning() << "Failed to open" << path << strerror(error);
+        }
+        pendingFds << QDBusUnixFileDescriptor(fd);
+        close(fd);
+
+        if (pendingFds.size() >= maximumBatchSize) {
+            addFilesAndClear();
+        }
+    }
+    addFilesAndClear();
+
+    QObject::connect(mimeData, &QObject::destroyed, iface, [transferId, iface] {
+        iface->StopTransfer(transferId);
+        iface->deleteLater();
+    });
+    QObject::connect(iface, &OrgFreedesktopPortalFileTransferInterface::TransferClosed, mimeData, [iface]() {
+        iface->deleteLater();
+    });
+
+    return true;
+#else
+    return false;
 #endif
 }
 

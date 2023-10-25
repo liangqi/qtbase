@@ -22,6 +22,7 @@
 QT_BEGIN_NAMESPACE
 
 class QWindow;
+class QMimeData;
 
 class Q_GUI_EXPORT QGenericUnixServices : public QPlatformServices
 {
@@ -38,10 +39,14 @@ public:
     void setApplicationBadge(qint64 number);
     virtual QString portalWindowIdentifier(QWindow *window);
 
+    bool exportUrlsToPortal(QMimeData *mimeData);
+    QList<QUrl> urlsFromMimeData(const QMimeData *mimeData);
+
 private:
     QString m_webBrowser;
     QString m_documentLauncher;
     bool m_hasScreenshotPortalWithColorPicking = false;
+    bool m_hasFileTransfer = false;
 };
 
 QT_END_NAMESPACE

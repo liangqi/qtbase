@@ -6,6 +6,10 @@
 #include <QDragEnterEvent>
 #include <QMimeData>
 
+#include <private/qguiapplication_p.h>
+#include <private/qgenericunixservices_p.h>
+#include <qpa/qplatformintegration.h>
+
 using namespace Qt::StringLiterals;
 
 //! [DropArea constructor]
@@ -44,6 +48,13 @@ void DropArea::dropEvent(QDropEvent *event)
 {
     const QMimeData *mimeData = event->mimeData();
 //! [dropEvent() function part1]
+
+    const auto unixServices = dynamic_cast<QGenericUnixServices *>(
+            QGuiApplicationPrivate::platformIntegration()->services());
+    if (unixServices) {
+        QList<QUrl> urlList = unixServices->urlsFromMimeData(mimeData);
+        qDebug() << "liang: " << urlList;
+    }
 
 //! [dropEvent() function part2]
     if (mimeData->hasImage()) {
